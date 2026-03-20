@@ -9,6 +9,19 @@ from omegaconf import OmegaConf
 from core.utils.utils import InputPadder
 from Utils import AMP_DTYPE, set_logging_format, set_seed, vis_disparity
 
+import warnings
+warnings.filterwarnings("ignore")
+
+# ==========================================
+# 全局变量：用于记录鼠标在窗口中的实时位置
+# ==========================================
+mouse_x, mouse_y = -1, -1
+
+def mouse_callback(event, x, y, flags, param):
+    global mouse_x, mouse_y
+    if event == cv2.EVENT_MOUSEMOVE:
+        mouse_x, mouse_y = x, y
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', default=f'{code_dir}/../weights/20-30-48/model_best_bp2_serialize.pth', type=str)
@@ -21,9 +34,7 @@ if __name__ == "__main__":
     set_seed(0)
     torch.autograd.set_grad_enabled(False)
 
-    # ==========================================
-    # 1. 初始化模型 (保持不变)
-    # ==========================================
+    # 1. 加载模型
     logging.info("正在加载 Fast-FoundationStereo 模型...")
     with open(f'{os.path.dirname(args.model_dir)}/cfg.yaml', 'r') as ff:
         cfg: dict = yaml.safe_load(ff)
@@ -38,74 +49,72 @@ if __name__ == "__main__":
     model.cuda().eval()
     logging.info("模型加载完成！")
 
-    # ==========================================
-    # 2. 硬件重置
-    # ==========================================
-    ctx = rs.context()
-    if len(ctx.devices) > 0:
-        logging.info("检测到 D435i，正在执行硬件重置...")
-        ctx.devices[0].hardware_reset()
-        time.sleep(3) # 等待相机重启
-    else:
-        logging.error("未检测到相机，请检查连接！")
-        sys.exit(1)
+    # 2. 准备 OpenCV 交互窗口
+    window_name = 'Live Depth (Left: IR, Right: Fast-FS)'
+    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(window_name, mouse_callback)
 
-    # ==========================================
-    # 3. 初始化 D435i 配置
-    # ==========================================
+    # 3. 初始化 D435i 管道配置
     pipeline = rs.pipeline()
     config = rs.config()
-    config.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, 15)
-    config.enable_stream(rs.stream.infrared, 2, 640, 480, rs.format.y8, 15)
-    
-    pipeline_started = False
-    logging.info("开始实时深度检测... 按 ESC 键退出")
+    config.enable_stream(rs.stream.infrared, 1, 424, 240, rs.format.y8, 15)
+    config.enable_stream(rs.stream.infrared, 2, 424, 240, rs.format.y8, 15)
 
-    # ==========================================
-    # 4. 具备自愈能力的实时推理主循环
-    # ==========================================
+    pipeline_started = False
+    cam_fx = 0.0
+    cam_baseline = 0.0
+    
+    logging.info("开始实时检测... 移动鼠标查看距离，按 ESC 退出。")
+
     try:
         while True:
-            # --- 状态机：如果通道未启动或掉线，自动执行启动流程 ---
+            # --- 深度自愈状态机与硬件参数提取 ---
             if not pipeline_started:
                 try:
+                    ctx = rs.context()
+                    if len(ctx.devices) == 0:
+                        logging.warning("物理设备丢失，等待系统重新挂载 USB...")
+                        time.sleep(2)
+                        continue
+                    
+                    logging.info("发现相机，正在执行底层硬件复位...")
+                    ctx.devices[0].hardware_reset()
+                    time.sleep(3) 
+
                     profile = pipeline.start(config)
-                    # 强制关闭红外发射器以降低功耗
                     device = profile.get_device()
                     depth_sensor = device.query_sensors()[0]
                     if depth_sensor.supports(rs.option.emitter_enabled):
                         depth_sensor.set_option(rs.option.emitter_enabled, 0)
-                    pipeline_started = True
-                    logging.info("👉 相机通道已成功(重新)连接！")
                     
-                    # 刚启动时丢弃1帧坏帧
-                    pipeline.wait_for_frames(5000)
+                    # 动态读取相机的内参 fx 和物理基线长度
+                    ir1_profile = profile.get_stream(rs.stream.infrared, 1)
+                    ir2_profile = profile.get_stream(rs.stream.infrared, 2)
+                    cam_fx = ir1_profile.as_video_stream_profile().get_intrinsics().fx
+                    cam_baseline = abs(ir2_profile.get_extrinsics_to(ir1_profile).translation[0])
+                    
+                    pipeline_started = True
+                    logging.info("👉 相机已连接！")
+                    for _ in range(3):
+                        pipeline.wait_for_frames(5000)
                 except Exception as e:
-                    logging.warning(f"相机启动失败，等待1秒后重试... ({e})")
-                    time.sleep(1)
+                    logging.error(f"恢复失败，稍后重试: {e}")
+                    time.sleep(2)
                     continue
 
-            # --- 正常抓取与推理流程 ---
+            # --- 正常推理流程 ---
             try:
-                # 抓取双目帧 (设置 5000ms 超时)
                 frames = pipeline.wait_for_frames(5000)
             except RuntimeError as e:
-                # ！！！核心自愈逻辑：检测到掉线，重置状态，停止废弃通道 ！！！
-                logging.error(f"❌ 数据流异常中断 ({e})，正在尝试硬件重连...")
                 pipeline_started = False
-                try:
-                    pipeline.stop()
-                except:
-                    pass
-                continue
+                try: pipeline.stop()
+                except: pass
+                continue 
 
             ir1_frame = frames.get_infrared_frame(1)
             ir2_frame = frames.get_infrared_frame(2)
-            
-            if not ir1_frame or not ir2_frame:
-                continue
+            if not ir1_frame or not ir2_frame: continue
 
-            # 转换为 numpy 数组并扩展为 3 通道
             ir1 = np.asanyarray(ir1_frame.get_data())
             ir2 = np.asanyarray(ir2_frame.get_data())
             img0 = np.tile(ir1[..., None], (1, 1, 3))
@@ -119,29 +128,66 @@ if __name__ == "__main__":
             padder = InputPadder(img0_tensor.shape, divis_by=32, force_square=False)
             img0_pad, img1_pad = padder.pad(img0_tensor, img1_tensor)
 
-            # 运行网络推理
+            # PyTorch 模型推理
             with torch.amp.autocast('cuda', enabled=True, dtype=AMP_DTYPE):
                 disp = model.forward(img0_pad, img1_pad, iters=args.valid_iters, test_mode=True, optimize_build_volume='pytorch1')
 
             disp = padder.unpad(disp.float())
             disp = disp.data.cpu().numpy().reshape(H, W).clip(0, None)
 
-            # 视差图可视化
-            vis = vis_disparity(disp, min_val=None, max_val=None, cmap=None, color_map=cv2.COLORMAP_TURBO)
-            
-            img0_bgr = cv2.cvtColor(img0.astype(np.uint8), cv2.COLOR_RGB2BGR)
-            combined_view = np.concatenate([img0_bgr, vis], axis=1)
+            # --- 核心：将视差转换为物理深度矩阵 (单位：米) ---
+            # 引入 1e-5 防止除以 0 的非法计算
+            depth_map = (cam_fx * args.scale * cam_baseline) / (disp + 1e-5)
 
-            cv2.imshow('Live Fast-FoundationStereo Depth (Left: IR, Right: Depth)', combined_view)
+            # 可视化处理与修复 RGB/BGR 错位 Bug
+            vis = vis_disparity(disp, min_val=None, max_val=None, cmap=None, color_map=cv2.COLORMAP_TURBO)
+            vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+            img0_bgr = cv2.cvtColor(img0.astype(np.uint8), cv2.COLOR_RGB2BGR)
+            combined_view = np.concatenate([img0_bgr, vis_bgr], axis=1)
+
+            # 将画面放大 2 倍以方便观看
+            display_view = cv2.resize(combined_view, (combined_view.shape[1]*2, combined_view.shape[0]*2))
+            disp_H, disp_W = display_view.shape[:2]
+
+            # --- 鼠标交互与深度信息绘制 ---
+            # 如果鼠标尚未移入窗口，默认探测左图的正中心点
+            if mouse_x < 0 or mouse_y < 0:
+                probe_x, probe_y = disp_W // 4, disp_H // 2
+            else:
+                probe_x, probe_y = mouse_x, mouse_y
+                
+            # 将鼠标在放大 2 倍的窗口上的坐标，映射回原始 HxW 分辨率
+            orig_x = probe_x // 2
+            orig_y = probe_y // 2
+            
+            # 判断鼠标是在左半屏(红外图)还是右半屏(深度图)，并统一换算为单张图的像素 X 坐标
+            pixel_x = orig_x - W if orig_x >= W else orig_x
+            pixel_y = orig_y
+            
+            # 防止索引越界
+            if 0 <= pixel_x < W and 0 <= pixel_y < H:
+                # 从深度矩阵中读取该像素的真实距离
+                d_val = depth_map[pixel_y, pixel_x]
+                
+                # 在左侧红外图和右侧深度图上，同步画出绿色的十字瞄准星
+                left_center = (pixel_x * 2, pixel_y * 2)
+                right_center = ((pixel_x + W) * 2, pixel_y * 2)
+                cv2.drawMarker(display_view, left_center, (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
+                cv2.drawMarker(display_view, right_center, (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
+                
+                # 绘制距离文字 (带黑色描边以防止在强光/全白背景下看不清)
+                text = f"Dist: {d_val:.3f} m"
+                cv2.putText(display_view, text, (probe_x + 15, probe_y - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
+                cv2.putText(display_view, text, (probe_x + 15, probe_y - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                
+            cv2.imshow(window_name, display_view)
             
             if cv2.waitKey(1) == 27:
                 break
 
     finally:
         try:
-            if pipeline_started:
-                pipeline.stop()
-        except:
-            pass
+            if pipeline_started: pipeline.stop()
+        except: pass
         cv2.destroyAllWindows()
-        logging.info("已安全退出视频流。")
+        logging.info("已安全退出。")
